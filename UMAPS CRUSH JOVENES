@@ -1,0 +1,203 @@
+Código R - UMAPs individuales por día
+
+suppressPackageStartupMessages({
+  library(Seurat); library(ggplot2); library(patchwork)
+})
+
+set.seed(1234)
+
+# Carpeta con tus .RDS
+data_dir <- "C:/Users/Usuario/Desktop/GSE TIPO DE LESION/iSNAT crush jovenes 0 1 3 7d"
+setwd(data_dir)
+
+# Función robusta estilo adaptada a Seurat v5
+run_umap_simple <- function(file) {
+  seu <- readRDS(file)
+  if (!inherits(seu, "Seurat")) {
+    if (requireNamespace("SeuratObject", quietly = TRUE)) {
+      seu <- tryCatch(as.Seurat(seu, counts = "counts", data = "logcounts"),
+                      error = function(e) stop("No puedo convertir a Seurat: ", basename(file)))
+    } else stop("Objeto no-Seurat y no puedo convertir: ", basename(file))
+  }
+  if(!"percent.mt" %in% colnames(seu@meta.data))
+    seu[["percent.mt"]] <- PercentageFeatureSet(seu, "^mt-")
+  seu <- subset(seu, nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 15)
+
+  counts <- tryCatch(GetAssayData(seu, assay="RNA", layer="counts"),
+                     error = function(e) NULL)
+  if (is.null(counts)) {
+    counts <- tryCatch(GetAssayData(seu, assay="RNA", slot="counts"),
+                       error = function(e) NULL)
+  }
+  if (!is.null(counts)) {
+    keep <- Matrix::rowSums(counts > 0) >= 3
+    seu <- subset(seu, features = rownames(counts)[keep])
+  }
+
+  seu <- SCTransform(seu, verbose = FALSE)
+  seu <- RunPCA(seu, verbose = FALSE, npcs = 50)
+  seu <- FindNeighbors(seu, dims = 1:30)
+  seu <- FindClusters(seu, resolution = 0.5)
+  seu <- RunUMAP(seu, dims = 1:30, verbose = FALSE)
+  seu
+}
+
+# Detecta y corre solo para los días presentes (0,3,7)
+files <- list.files(pattern = "\\.RDS$", full.names = TRUE, ignore.case = TRUE)
+get_tp <- function(f) regmatches(basename(f), regexpr("day_\\d+", basename(f)))
+tps   <- sub("day_", "", get_tp(files))
+sel   <- !is.na(tps) & tps %in% c("0","3","7")
+files <- files[sel]; tps <- tps[sel]
+
+objs <- lapply(files, run_umap_simple)
+names(objs) <- paste0("day", tps)
+
+# Guardado de objetos y figuras
+for (nm in names(objs)) {
+  p <- DimPlot(objs[[nm]], label = TRUE, pt.size = 0.6) +
+    ggtitle(paste("UMAP", nm)) +
+    theme(axis.text = element_text(size=12),
+          axis.title = element_text(size=14),
+          plot.title = element_text(size=16, face="bold"))
+  saveRDS(objs[[nm]], file = file.path(data_dir, paste0("iSNAT_", nm, "_processed_simple.rds")))
+  ggsave(file.path(data_dir, paste0("UMAP_", nm, "_clusters_simple.png")),
+         p, width = 7, height = 6, dpi = 300)
+}
+
+Anotación SingleR y marcadores por día
+suppressPackageStartupMessages({
+  library(Seurat); library(SingleR); library(celldex)
+  library(dplyr); library(ggplot2); library(readr)
+})
+
+set.seed(1234)
+
+data_dir <- "C:/Users/Usuario/Desktop/GSE TIPO DE LESION/iSNAT crush jovenes 0 1 3 7d"
+out_dir  <- file.path(data_dir, "outputs_annotation")
+if(!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# Usa los objetos de la sesión si existen; si no, carga los .rds
+seu_list <- list()
+if (exists("objs")) {
+  seu_list <- objs
+} else {
+  cand <- list.files(data_dir, pattern = "iSNAT_day.*_processed_simple\\.rds$", 
+                     full.names = TRUE, ignore.case = TRUE)
+  stopifnot(length(cand) > 0)
+  get_nm <- function(p) sub("^.*(day\\d+).*", "\\1", basename(p))
+  nms <- vapply(cand, get_nm, character(1))
+  seu_list <- setNames(lapply(cand, readRDS), nms)
+}
+
+ref <- celldex::MouseRNAseqData()
+
+annotate_and_markers <- function(seu, name_tag){
+  DefaultAssay(seu) <- "RNA"
+  seu <- NormalizeData(seu, normalization.method = "LogNormalize", 
+                       scale.factor = 10000, verbose = FALSE)
+  test_mat <- GetAssayData(seu, assay = "RNA", layer = "data")
+  ann <- SingleR(test = test_mat, ref = ref, labels = ref$label.main)
+  seu$celltype <- ann$labels
+
+  p_anno <- DimPlot(seu, group.by = "celltype", label = TRUE, repel = TRUE) +
+    ggtitle(paste0("UMAP ", name_tag, " · Tipos celulares (SingleR)"))
+  ggsave(file.path(out_dir, paste0("UMAP_", name_tag, "_SingleR.png")),
+         p_anno, width = 9, height = 6, dpi = 300)
+
+  DefaultAssay(seu) <- if ("SCT" %in% Assays(seu)) "SCT" else "RNA"
+  markers <- FindAllMarkers(seu, only.pos = TRUE, min.pct = 0.25, 
+                            logfc.threshold = 0.25, verbose = FALSE)
+  readr::write_csv(markers, file.path(out_dir, paste0("markers_", name_tag, "_clusters.csv")))
+
+  top_markers <- markers %>% group_by(cluster) %>% slice_max(n = 5, order_by = avg_log2FC)
+  readr::write_csv(top_markers, file.path(out_dir, paste0("markers_", name_tag, "_top5_por_cluster.csv")))
+
+  Idents(seu) <- "seurat_clusters"
+  clust_levels <- levels(Idents(seu))
+  if (all(c("0","1") %in% clust_levels)) {
+    de01 <- FindMarkers(seu, ident.1 = 0, ident.2 = 1, 
+                        min.pct = 0.25, logfc.threshold = 0.25)
+    de01$gene <- rownames(de01)
+    de01$significant <- ifelse(de01$p_val_adj < 0.05 & abs(de01$avg_log2FC) > 0.5, "Sí", "No")
+    readr::write_csv(de01, file.path(out_dir, paste0("DE_cluster0_vs1_", name_tag, ".csv")))
+
+    p_volc <- ggplot(de01, aes(x = avg_log2FC, y = -log10(p_val_adj), color = significant)) +
+      geom_point(alpha = 0.8) + scale_color_manual(values = c("grey", "red")) +
+      theme_minimal() + labs(title = paste0("Volcán: clúster 0 vs 1 (", name_tag, ")"),
+                             x = "Log2 cambio de expresión", y = "-log10 p-valor ajustado")
+    ggsave(file.path(out_dir, paste0("Volcan_0vs1_", name_tag, ".png")),
+           p_volc, width = 7, height = 5, dpi = 300)
+  }
+  saveRDS(seu, file.path(out_dir, paste0("iSNAT_", name_tag, "_annotated.rds")))
+  invisible(seu)
+}
+
+for (nm in names(seu_list)) {
+  message("Anotando y buscando marcadores: ", nm)
+  seu_list[[nm]] <- annotate_and_markers(seu_list[[nm]], nm)
+}
+
+message("Listo. Revisa: ", out_dir)
+
+Renombrar clusters:
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tibble)
+
+# Día 0 
+Idents(objs$day0) <- factor(objs$day0$seurat_clusters)
+new.cluster.ids.day0 <- c(
+  "Fibro_eMES", "Neurona_DRG", "Endotelio_BNB", "Mieloide_resid", "SC_mieliniz",
+  "Epitelio_contam", "APC_mixta", "Fibro_CXCL", "Eritro", "Mesotelio",
+  "Prog_mesen", "vSMC", "Pericito", "Neurona_noci", "vSMC_alt", "cDC_conv",
+  "EC_linfa", "Masto", "Linf_T", "EC_fenestr", "Epitelio_simp", "Prolif_S"
+)
+names(new.cluster.ids.day0) <- levels(objs$day0)
+objs$day0 <- RenameIdents(objs$day0, new.cluster.ids.day0)
+
+# Día 3
+Idents(objs$day3) <- factor(objs$day3$seurat_clusters)
+new.cluster.ids.day3 <- c(
+  "Mono_inflam", "Fibro_dMES", "Mac_GPNMB", "Fibro_CXCL", "SC_satGFAP",
+  "cDC_MoDC", "Mac_inflam", "Epitelio_contam", "EC_angio", "Fibro_LRRC15",
+  "SC_repar", "vSMC", "Mesotelio_contam", "cDC_madura", "NK",
+  "Neutro", "Prolif_hist", "cDC1", "Masto"
+)
+names(new.cluster.ids.day3) <- levels(objs$day3)
+objs$day3 <- RenameIdents(objs$day3, new.cluster.ids.day3)
+
+# Día 7 
+Idents(objs$day7) <- factor(objs$day7$seurat_clusters)
+new.cluster.ids.day7 <- c(
+  "Fibro_ECM", "Mac_GPNMB_B", "Mac_FOLR2", "SC_repar", "cDC_CD209a", "Linf_T_act",
+  "SC_Sox10", "Perivas_ECM", "Epitelio_contam", "NK", "Axon_TdT", "Mac_infla",
+  "EC_ROBO4", "Fibro_COL2", "Prog_DLk1", "cDC2_MoDC", "cDC1_prolif",
+  "Pericito_Notch3", "Prolif_mito", "Mesot_MSLN", "vSMC_OLFR", "Cel_B",
+  "Mac_alt", "Masto", "Mieloide_IFN"
+)
+names(new.cluster.ids.day7) <- levels(objs$day7)
+objs$day7 <- RenameIdents(objs$day7, new.cluster.ids.day7)
+p0 <- DimPlot(objs$day0, reduction = "umap", label = TRUE, pt.size = 0.5) +
+  ggtitle("UMAP day0") +
+  theme(plot.title = element_text(size = 16, face = "bold"))
+p3 <- DimPlot(objs$day3, reduction = "umap", label = TRUE, pt.size = 0.5) +
+  ggtitle("UMAP day3") +
+  theme(plot.title = element_text(size = 16, face = "bold"))
+p7 <- DimPlot(objs$day7, reduction = "umap", label = TRUE, pt.size = 0.5) +
+  ggtitle("UMAP day7") +
+  theme(plot.title = element_text(size = 16, face = "bold"))
+
+# Guardar figuras
+dir.create("outputs_figs", showWarnings = FALSE)
+ggsave("outputs_figs/UMAP_day0_named.png", p0, width = 9, height = 7, dpi = 300)
+ggsave("outputs_figs/UMAP_day3_named.png", p3, width = 9, height = 7, dpi = 300)
+ggsave("outputs_figs/UMAP_day7_named.png", p7, width = 9, height = 7, dpi = 300)
+panel <- (p0 | p3) / p7
+ggsave("outputs_figs/UMAP_panel_named.png", panel, width = 15, height = 10, dpi = 300)
+```
+
+
+
+
